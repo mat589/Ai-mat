@@ -19,6 +19,10 @@ from io import BytesIO
 from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
 from emergentintegrations.llm.gemeni.image_generation import GeminiImageGeneration
 
+# Import Hugging Face Diffusers for fallback image generation
+from diffusers import StableDiffusionPipeline
+import torch
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
