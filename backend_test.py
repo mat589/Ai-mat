@@ -111,23 +111,12 @@ class AIBackendTests(unittest.TestCase):
         logger.info("System status endpoint test passed!")
     
     def test_02_chat_session_management(self):
-        """Test chat session creation, listing, and deletion"""
+        """Test chat session management"""
         logger.info("Testing chat session management...")
         
-        # Create a new chat session
-        session_title = f"Test Session {int(time.time())}"
-        create_response = requests.post(
-            f"{API_URL}/chat/sessions", 
-            json={"title": session_title}
-        )
-        self.assertEqual(create_response.status_code, 200, f"Session creation failed: {create_response.text}")
-        session_data = create_response.json()
-        self.assertIn("id", session_data)
-        self.assertEqual(session_data["title"], session_title)
-        
-        # Store session ID for later tests
-        self.session_id = session_data["id"]
-        logger.info(f"Created session with ID: {self.session_id}")
+        # Verify we have a session ID from setup
+        self.assertIsNotNone(self.session_id, "Session ID not available, session creation failed in setup")
+        logger.info(f"Using session with ID: {self.session_id}")
         
         # Get all sessions
         list_response = requests.get(f"{API_URL}/chat/sessions")
