@@ -59,6 +59,29 @@ key_usage_count = {}
 for i, key in enumerate(GEMINI_KEYS):
     key_usage_count[i] = 0
 
+# Hugging Face Stable Diffusion Pipeline (lazy loaded)
+_hf_pipeline = None
+
+def get_hf_pipeline():
+    """Get or create Hugging Face Stable Diffusion pipeline"""
+    global _hf_pipeline
+    if _hf_pipeline is None:
+        try:
+            model_id = "CompVis/stable-diffusion-v1-4"
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            _hf_pipeline = StableDiffusionPipeline.from_pretrained(
+                model_id,
+                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+                safety_checker=None,
+                requires_safety_checker=False
+            )
+            _hf_pipeline.to(device)
+            logger.info(f"Loaded Stable Diffusion pipeline on device: {device}")
+        except Exception as e:
+            logger.error(f"Failed to load Stable Diffusion pipeline: {str(e)}")
+            _hf_pipeline = None
+    return _hf_pipeline
+
 # Key Management Functions
 def get_next_api_key():
     """Smart key rotation with usage tracking"""
