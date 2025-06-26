@@ -1,4 +1,5 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File
+from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -6,10 +7,17 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime
+import asyncio
+import json
+import base64
+from io import BytesIO
 
+# Import emergentintegrations
+from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
+from emergentintegrations.llm.gemeni.image_generation import GeminiImageGeneration
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -19,38 +27,327 @@ mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
+# Gemini API Keys Pool
+GEMINI_KEYS = [
+    os.environ['GEMINI_API_KEY_1'],
+    os.environ['GEMINI_API_KEY_2'],
+    os.environ['GEMINI_API_KEY_3'],
+    os.environ['GEMINI_API_KEY_4'],
+    os.environ['GEMINI_API_KEY_5'],
+    os.environ['GEMINI_API_KEY_6'],
+    os.environ['GEMINI_API_KEY_7'],
+    os.environ['GEMINI_API_KEY_8'],
+    os.environ['GEMINI_API_KEY_9'],
+    os.environ['GEMINI_API_KEY_10'],
+]
+
 # Create the main app without a prefix
-app = FastAPI()
+app = FastAPI(title="AI Chatbot API", description="All-in-one AI chatbot with chat, image generation, and analysis")
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
+# Global key rotation state
+current_key_index = 0
+key_usage_count = {}
 
-# Define Models
-class StatusCheck(BaseModel):
+# Initialize usage tracking
+for i, key in enumerate(GEMINI_KEYS):
+    key_usage_count[i] = 0
+
+# Key Management Functions
+def get_next_api_key():
+    """Smart key rotation with usage tracking"""
+    global current_key_index
+    
+    # Find key with lowest usage
+    min_usage = min(key_usage_count.values())
+    for i, usage in key_usage_count.items():
+        if usage == min_usage:
+            current_key_index = i
+            break
+    
+    key_usage_count[current_key_index] += 1
+    return GEMINI_KEYS[current_key_index]
+
+async def create_gemini_chat(session_id: str, system_message: str = "You are a helpful AI assistant."):
+    """Create a new Gemini chat instance with key rotation"""
+    api_key = get_next_api_key()
+    chat = LlmChat(
+        api_key=api_key,
+        session_id=session_id,
+        system_message=system_message
+    ).with_model("gemini", "gemini-2.0-flash")
+    return chat
+
+async def create_gemini_image_generator():
+    """Create Gemini image generator with key rotation"""
+    api_key = get_next_api_key()
+    return GeminiImageGeneration(api_key=api_key)
+
+# Data Models
+class ChatSession(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
+    title: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+class ChatMessage(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    session_id: str
+    role: str  # "user" or "assistant"
+    content: str
+    image_base64: Optional[str] = None
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+    image_base64: Optional[str] = None
 
-# Add your routes to the router instead of directly to app
+class ImageGenerationRequest(BaseModel):
+    prompt: str
+    session_id: Optional[str] = None
+
+class ChatSessionCreate(BaseModel):
+    title: str
+
+# Chat Endpoints
+@api_router.post("/chat/sessions", response_model=ChatSession)
+async def create_chat_session(session: ChatSessionCreate):
+    """Create a new chat session"""
+    session_obj = ChatSession(title=session.title)
+    session_dict = session_obj.dict()
+    await db.chat_sessions.insert_one(session_dict)
+    return session_obj
+
+@api_router.get("/chat/sessions", response_model=List[ChatSession])
+async def get_chat_sessions():
+    """Get all chat sessions"""
+    sessions = await db.chat_sessions.find().sort("updated_at", -1).to_list(100)
+    return [ChatSession(**session) for session in sessions]
+
+@api_router.get("/chat/sessions/{session_id}/messages", response_model=List[ChatMessage])
+async def get_chat_messages(session_id: str):
+    """Get messages for a specific chat session"""
+    messages = await db.chat_messages.find({"session_id": session_id}).sort("timestamp", 1).to_list(1000)
+    return [ChatMessage(**message) for message in messages]
+
+@api_router.delete("/chat/sessions/{session_id}")
+async def delete_chat_session(session_id: str):
+    """Delete a chat session and all its messages"""
+    await db.chat_sessions.delete_one({"id": session_id})
+    await db.chat_messages.delete_many({"session_id": session_id})
+    return {"message": "Session deleted successfully"}
+
+async def save_message(session_id: str, role: str, content: str, image_base64: Optional[str] = None):
+    """Save message to database"""
+    message = ChatMessage(
+        session_id=session_id,
+        role=role,
+        content=content,
+        image_base64=image_base64
+    )
+    await db.chat_messages.insert_one(message.dict())
+    
+    # Update session timestamp
+    await db.chat_sessions.update_one(
+        {"id": session_id},
+        {"$set": {"updated_at": datetime.utcnow()}}
+    )
+    return message
+
+@api_router.post("/chat/message")
+async def chat_message(request: ChatRequest):
+    """Send a chat message and get AI response"""
+    try:
+        session_id = request.session_id or str(uuid.uuid4())
+        
+        # Save user message
+        user_message = await save_message(session_id, "user", request.message, request.image_base64)
+        
+        # Create chat instance
+        chat = await create_gemini_chat(session_id)
+        
+        # Prepare user message for AI
+        user_msg_content = []
+        if request.image_base64:
+            # Add image content
+            image_content = ImageContent(image_base64=request.image_base64)
+            user_msg = UserMessage(
+                text=request.message,
+                file_contents=[image_content]
+            )
+        else:
+            user_msg = UserMessage(text=request.message)
+        
+        # Get AI response
+        ai_response = await chat.send_message(user_msg)
+        
+        # Save AI response
+        ai_message = await save_message(session_id, "assistant", ai_response)
+        
+        return {
+            "session_id": session_id,
+            "user_message": user_message.dict(),
+            "ai_response": ai_message.dict(),
+            "key_usage_stats": key_usage_count
+        }
+        
+    except Exception as e:
+        logging.error(f"Chat error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
+
+@api_router.post("/chat/stream/{session_id}")
+async def stream_chat(session_id: str, request: ChatRequest):
+    """Stream chat response in real-time"""
+    async def generate_response():
+        try:
+            # Save user message
+            await save_message(session_id, "user", request.message, request.image_base64)
+            
+            # Create chat instance
+            chat = await create_gemini_chat(session_id)
+            
+            # Prepare user message
+            if request.image_base64:
+                image_content = ImageContent(image_base64=request.image_base64)
+                user_msg = UserMessage(
+                    text=request.message,
+                    file_contents=[image_content]
+                )
+            else:
+                user_msg = UserMessage(text=request.message)
+            
+            # Stream response (Note: emergentintegrations may not support streaming yet)
+            # This is a placeholder for streaming implementation
+            ai_response = await chat.send_message(user_msg)
+            
+            # Simulate streaming by yielding chunks
+            words = ai_response.split()
+            full_response = ""
+            
+            for word in words:
+                full_response += word + " "
+                yield f"data: {json.dumps({'content': word + ' ', 'done': False})}\n\n"
+                await asyncio.sleep(0.05)  # Small delay for streaming effect
+            
+            # Save complete response
+            await save_message(session_id, "assistant", ai_response)
+            
+            yield f"data: {json.dumps({'content': '', 'done': True, 'session_id': session_id})}\n\n"
+            
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e), 'done': True})}\n\n"
+    
+    return StreamingResponse(
+        generate_response(),
+        media_type="text/plain",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+    )
+
+# Image Generation Endpoints
+@api_router.post("/image/generate")
+async def generate_image(request: ImageGenerationRequest):
+    """Generate image from text prompt"""
+    try:
+        session_id = request.session_id or str(uuid.uuid4())
+        
+        # Save user request
+        await save_message(session_id, "user", f"Generate image: {request.prompt}")
+        
+        # Create image generator
+        image_gen = await create_gemini_image_generator()
+        
+        # Generate image
+        images = await image_gen.generate_images(
+            prompt=request.prompt,
+            model="imagen-3.0-generate-002",
+            number_of_images=1
+        )
+        
+        if images and len(images) > 0:
+            # Convert to base64
+            image_base64 = base64.b64encode(images[0]).decode('utf-8')
+            
+            # Save AI response with image
+            ai_message = await save_message(
+                session_id, 
+                "assistant", 
+                f"Generated image: {request.prompt}",
+                image_base64
+            )
+            
+            return {
+                "session_id": session_id,
+                "image_base64": image_base64,
+                "prompt": request.prompt,
+                "message": ai_message.dict(),
+                "key_usage_stats": key_usage_count
+            }
+        else:
+            raise HTTPException(status_code=500, detail="No image was generated")
+            
+    except Exception as e:
+        logging.error(f"Image generation error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
+
+@api_router.post("/image/analyze")
+async def analyze_image(file: UploadFile = File(...), prompt: str = "Describe this image in detail"):
+    """Analyze an uploaded image"""
+    try:
+        # Read image file
+        image_data = await file.read()
+        image_base64 = base64.b64encode(image_data).decode('utf-8')
+        
+        session_id = str(uuid.uuid4())
+        
+        # Save user request
+        await save_message(session_id, "user", f"Analyze image: {prompt}", image_base64)
+        
+        # Create chat instance
+        chat = await create_gemini_chat(session_id)
+        
+        # Analyze image
+        image_content = ImageContent(image_base64=image_base64)
+        user_msg = UserMessage(
+            text=prompt,
+            file_contents=[image_content]
+        )
+        
+        ai_response = await chat.send_message(user_msg)
+        
+        # Save AI response
+        ai_message = await save_message(session_id, "assistant", ai_response)
+        
+        return {
+            "session_id": session_id,
+            "analysis": ai_response,
+            "prompt": prompt,
+            "message": ai_message.dict(),
+            "key_usage_stats": key_usage_count
+        }
+        
+    except Exception as e:
+        logging.error(f"Image analysis error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Image analysis failed: {str(e)}")
+
+# System Status Endpoints
+@api_router.get("/status")
+async def get_system_status():
+    """Get system status including key usage"""
+    return {
+        "status": "online",
+        "total_keys": len(GEMINI_KEYS),
+        "key_usage_stats": key_usage_count,
+        "current_key_index": current_key_index,
+        "total_requests": sum(key_usage_count.values()),
+        "database_connected": True
+    }
+
 @api_router.get("/")
 async def root():
-    return {"message": "Hello World"}
-
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.dict()
-    status_obj = StatusCheck(**status_dict)
-    _ = await db.status_checks.insert_one(status_obj.dict())
-    return status_obj
-
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find().to_list(1000)
-    return [StatusCheck(**status_check) for status_check in status_checks]
+    return {"message": "AI Chatbot API is running!", "version": "1.0.0"}
 
 # Include the router in the main app
 app.include_router(api_router)
