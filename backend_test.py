@@ -26,9 +26,26 @@ API_URL = f"{BACKEND_URL}/api"
 class AIBackendTests(unittest.TestCase):
     """Test suite for the AI Chatbot Backend API"""
     
+    @classmethod
+    def setUpClass(cls):
+        """Setup for all tests - runs once before all tests"""
+        # Create a session that will be used by all tests
+        session_title = f"Test Session {int(time.time())}"
+        create_response = requests.post(
+            f"{API_URL}/chat/sessions", 
+            json={"title": session_title}
+        )
+        
+        if create_response.status_code == 200:
+            session_data = create_response.json()
+            cls.session_id = session_data["id"]
+            logger.info(f"Created session with ID: {cls.session_id}")
+        else:
+            logger.error(f"Failed to create session: {create_response.text}")
+            cls.session_id = None
+    
     def setUp(self):
-        """Setup for tests"""
-        self.session_id = None
+        """Setup for individual tests"""
         self.test_image_path = self.create_test_image()
     
     def create_test_image(self):
