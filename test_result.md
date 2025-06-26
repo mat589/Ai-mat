@@ -148,7 +148,7 @@ backend:
         comment: "Implemented image generation using Gemini's imagen-3.0-generate-002 model with base64 encoding for frontend display and session integration."
       - working: false
         agent: "testing"
-        comment: "Image generation API is not working due to a Gemini API limitation. Error: 'Imagen API is only accessible to billed users at this time.' This is a limitation of the free tier of Gemini API and not an implementation issue."
+        comment: "Image generation API is not working due to a Gemini API limitation. Error: 'Imagen API is only accessible to billed users at this time.' This is a limitation of the free tier of Gemini API and not an implementation issue. Research confirms that Imagen models (both Imagen 3 and Imagen 4) require a paid subscription to access via the Gemini API. Consider using an alternative free image generation API or implementing a fallback mechanism."
 
   - task: "Image Analysis API"
     implemented: true
